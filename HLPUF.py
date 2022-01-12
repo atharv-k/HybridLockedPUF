@@ -1,5 +1,4 @@
 import netsquid as ns
-import pydynaa
 from netsquid.nodes import Node, Network
 from netsquid.components import Component
 from netsquid.nodes.connections import DirectConnection
@@ -7,9 +6,7 @@ import random as rd
 from netsquid.qubits.qubitapi import *
 from netsquid.protocols import NodeProtocol
 import numpy as np
-from netsquid.components.models import FibreDelayModel, FibreLossModel, DepolarNoiseModel, FixedDelayModel
 from netsquid.components import QuantumChannel, ClassicalChannel
-from pydynaa.core import SimulationEngine
 
 class ClassicalPUF(Component):
 
@@ -19,8 +16,8 @@ class ClassicalPUF(Component):
         self.crp = None
 
     def CRP(self):
-        challenge = np.random.RandomState(seed=2).randint(0,2,(self.no_of_challenges,2))
-        response = np.random.RandomState(seed=5).randint(0,2,(self.no_of_challenges,4))
+        challenge = np.random.RandomState(seed=2).randint(0,2,(self.no_of_challenges,8))
+        response = np.random.RandomState(seed=5).randint(0,2,(self.no_of_challenges,16))
         challenge = [tuple(c) for c in challenge]
         response = [tuple(r) for r in response]
         cr_pairs = dict(zip(challenge,response))
@@ -28,6 +25,28 @@ class ClassicalPUF(Component):
 
     def eval(self,challenge):
         return np.asarray(self.crp[tuple(challenge)])
+
+def response_to_quantum_states(*args):
+    state_1 = None
+    if args[0][0] == 0 and args[0][1] == 0:
+        state_1 = ns.qubits.ketstates.s0
+    elif args[0][0] == 0 and args[0][1] == 1:
+        state_1 = ns.qubits.ketstates.s1
+    elif args[0][0] == 1 and args[0][1] == 0:
+        state_1 = ns.qubits.ketstates.h0
+    else:
+        state_1 = ns.qubits.ketstates.h1
+    for i in range(1, len(args)):
+        if args[i][0] == 0 and args[i][1] == 0:
+            state_1 = np.kron(state_1, ns.qubits.ketstates.s0)
+        elif args[i][0] == 0 and args[i][1] == 1:
+            state_1 = np.kron(state_1, ns.qubits.ketstates.s1)
+        elif args[i][0] == 1 and args[i][1] == 0:
+            state_1 = np.kron(state_1, ns.qubits.ketstates.h0)
+        else:
+            state_1 = np.kron(state_1, ns.qubits.ketstates.h1)
+
+    return state_1
 
 class ClientProtocol(NodeProtocol):
 
@@ -43,21 +62,17 @@ class ClientProtocol(NodeProtocol):
         yield self.await_port_input(cout)
         [challenge] = cout.rx_input().items
         response = puf.eval(challenge)
-        response_1 = [bit for index, bit in enumerate(response) if index % 2 == 0]
-        response_2 = [bit for index, bit in enumerate(response) if index % 2 != 0]
-        response = list(zip(response_1,response_2))
-        for element in response:
-            qubit, = create_qubits(1,"Q",True)
-            if element[0]==0 and element[1]==0:
-                assign_qstate(qubit,ns.qubits.ketstates.s0)
-            elif element[0]==0 and element[1]==1:
-                assign_qstate(qubit,ns.qubits.ketstates.s1)
-            elif element[0]==1 and element[1]==0:
-                assign_qstate(qubit,ns.qubits.ketstates.h0)
-            else:
-                assign_qstate(qubit,ns.qubits.ketstates.h1)
-            qin.tx_output(qubit)
-            yield self.await_timer(1)
+        response = list(zip([bit for index, bit in enumerate(response) if index % 2 == 0],[bit for index, bit in enumerate(response) if index % 2 != 0]))
+        response_1 = create_qubits(len(response) // 2, "Q", True)
+        response_2 = create_qubits(len(response) // 2, "Q", True)
+        assign_qstate(response_1, response_to_quantum_states(*response[:len(response) // 2]))
+        assign_qstate(response_2, response_to_quantum_states(*response[len(response) // 2:len(response)]))
+        yield self.await_port_input(qin)
+        r1 = qin.rx_input().items
+        if round(fidelity(r1, response_1[0].qstate.qrepr.ket)) == 1:
+            qin.tx_output(response_2)
+        else:
+            print('Authentication failed !!')
 
 class ServerProtocol(NodeProtocol):
 
@@ -73,27 +88,23 @@ class ServerProtocol(NodeProtocol):
         self.database = puf.crp
         crp = rd.sample(self.database.items(),1)
         [(challenge,response)] = crp
-        response_1 = [bit for index, bit in enumerate(response) if index % 2 == 0]
-        response_2 = [bit for index, bit in enumerate(response) if index % 2 != 0]
-        response = list(zip(response_1,response_2))
+        response = list(zip([bit for index, bit in enumerate(response) if index % 2 == 0],[bit for index, bit in enumerate(response) if index % 2 != 0]))
+        response_1 = create_qubits(len(response) // 2, "Q", True)
+        response_2 = create_qubits(len(response) // 2, "Q", True)
+        assign_qstate(response_1, response_to_quantum_states(*response[:len(response) // 2]))
+        assign_qstate(response_2, response_to_quantum_states(*response[len(response) // 2:len(response)]))
         cout.tx_output(challenge)
-        received_response = []
-        for i in range(len(response)):
-            yield self.await_port_input(qin)
-            [qubit] = qin.rx_input().items
-            if response[i][0]==0:
-                m , _ = measure(qubit,ns.Z,discard=True)
-                received_response.append((0,m))
-                yield self.await_timer(1)
-            else:
-                m,_ = measure(qubit,ns.X,discard=True)
-                received_response.append((1,m))
-                yield self.await_timer(1)
+        qin.tx_output(response_1)
+        yield self.await_port_input(qin)
+        r2 = qin.rx_input().items
+        if round(fidelity(r2, response_2[0].qstate.qrepr.ket)) == 1:
+            print('The client authenticated succesfully!')
+        else:
+            print('Authentication failed !!')
 
-        print(f'The response received form the client is matching: {response==received_response}')
 
         
-n = 10000
+n = 20
 
 client = Node("Client", port_names=["client_qport","client_cport"])
 server = Node("Server", port_names=["server_qport","server_cport"])
@@ -115,4 +126,5 @@ client_protocol = ClientProtocol(client)
 server_protocol = ServerProtocol(server)
 client_protocol.start()
 server_protocol.start()
-ns.sim_run()
+stats = ns.sim_run()
+print(stats)
